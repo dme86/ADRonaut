@@ -33,6 +33,26 @@ var (
 
 	activeStyle  = lipgloss.NewStyle().Bold(true).Underline(true)
 	framePadding = 2
+
+	chipBase = lipgloss.NewStyle().
+			Padding(0, 1).
+			Bold(true).
+			MarginLeft(1).
+			Foreground(lipgloss.Color("0"))
+
+	chipColors = map[string]string{
+		"Titel":        "219", // pink
+		"Tags":         "135", // magenta
+		"Beteiligte":   "39",  // blau
+		"Kontext":      "70",  // grün
+		"Entscheidung": "214", // orange
+		"Alternativen": "63",  // violett
+		"Konsequenzen": "203", // rot
+		"Dateiname":    "244", // grau
+	}
+
+	snippetStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	highlightStyle = lipgloss.NewStyle().Underline(true).Foreground(lipgloss.Color("205")).Bold(true)
 )
 
 /* ------------------------------ Autosave ---------------------------------- */
@@ -164,6 +184,16 @@ func (lf *listField) NonEmptyCount() int {
 }
 
 // Draft-Helfer
+
+func chip(label string) string {
+	bg := chipColors[label]
+	st := chipBase
+	if bg != "" {
+		st = st.Background(lipgloss.Color(bg))
+	}
+	return st.Render(label)
+}
+
 func (lf *listField) Values() []string {
 	out := make([]string, 0, len(lf.items))
 	for i := range lf.items {
@@ -224,13 +254,27 @@ type fileOption struct {
 
 const newAdrSentinel = "__NEW_ADR__"
 
+type searchDoc struct {
+	Title, Status, Beteiligte, Tags                   string
+	Kontext, Entscheidung, Alternativen, Konsequenzen string
+	Full                                              string // sämtlicher Text in Kleinbuchstaben für Volltext
+}
+
 /* --------------------------------- Model ---------------------------------- */
 
 type model struct {
 	// Startup-Picker
 	startup     bool
+	allOptions  []fileOption
 	pickOptions []fileOption
 	pickIdx     int
+	filter      textinput.Model
+	searchIndex map[string]string
+
+	searchDocs map[string]searchDoc
+	hitBadges  map[string][]string
+	hitSnippet map[string]string
+	lastQuery  string
 
 	// Edit-Kontext
 	editingPath    string
@@ -272,7 +316,23 @@ func initialModel() model {
 	all = append(all, fileOption{Label: "➕ Neuer ADR", Path: newAdrSentinel, No: 0})
 	all = append(all, drafts...)
 	all = append(all, opts...)
+	m.allOptions = all
+	m.searchDocs = buildSearchDocs(all)
+	//	m.searchIndex = buildSearchIndex(all)
 	m.pickOptions = all
+	m.startup = true
+	m.pickIdx = 0
+
+	// Suchfeld
+	f := textinput.New()
+	f.Placeholder = "Tippen zum Filtern (Titel/Tags/Inhalt)"
+	f.Prompt = "🔎 "
+	f.CharLimit = 256
+	f.Width = 40
+	m.filter = f
+	m.filter.Focus()
+
+	m.applyFilter("") // initial alle anzeigen
 	m.startup = true
 	m.pickIdx = 0
 
@@ -315,9 +375,6 @@ func initialModel() model {
 }
 
 func (m model) Init() tea.Cmd {
-	if m.startup {
-		return nil
-	}
 	return textinput.Blink
 }
 
@@ -351,28 +408,55 @@ func (m model) viewPicker() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("ADRonaut – Datei auswählen oder neuen ADR anlegen"))
 	b.WriteString("\n\n")
+
+	// Suchfeld
+	b.WriteString(m.filter.View())
+	b.WriteString("\n\n")
+
 	hasDraft := false
-	for _, o := range m.pickOptions {
-		if o.Draft {
-			hasDraft = true
-			break
-		}
+	// (Rest unverändert …)
+
+	if len(m.pickOptions) == 1 { // nur "Neuer ADR"
+		b.WriteString("(Keine ADRs im aktuellen Verzeichnis gefunden)\n\n")
 	}
 	if hasDraft {
 		b.WriteString(helpStyle.Render("Es liegen unveröffentlichte Entwürfe vor – du kannst sie wiederherstellen.") + "\n\n")
 	}
-	if len(m.pickOptions) == 1 {
-		b.WriteString("(Keine ADRs im aktuellen Verzeichnis gefunden)\n\n")
-	}
+
+	// Liste rendern
+	// Liste rendern
 	for i, opt := range m.pickOptions {
 		st := optionStyle
-		if i == m.pickIdx {
+		isSel := (!m.filter.Focused() && i == m.pickIdx)
+		if isSel {
 			st = selectedStyle
 		}
-		b.WriteString(st.Render(opt.Label))
-		b.WriteString("\n")
+
+		line := st.Render(opt.Label)
+
+		// Badges anhängen
+		if bs := m.hitBadges[opt.Path]; len(bs) > 0 {
+			for _, b := range bs {
+				line += " " + chip(b)
+			}
+		}
+		b.WriteString(line + "\n")
+
+		// Snippet nur für die aktuelle Auswahl zeigen (gegen Clutter)
+		if isSel {
+			if sn := strings.TrimSpace(m.hitSnippet[opt.Path]); sn != "" {
+				b.WriteString("  " + sn + "\n")
+			}
+		}
 	}
-	b.WriteString("\n" + m.help("TAB/SHIFT+TAB wählen · ENTER öffnen · ESC/STRG+C beenden"))
+
+	// Kontextsensitive Hilfe
+	helpText := "TAB oder ↑/↓ wählen · SHIFT/Tab zurück zur Suche · ENTER öffnen · ESC/STRG+C beenden"
+	if m.filter.Focused() {
+		helpText = "TAB zur Liste · ENTER öffnen · ESC/STRG+C beenden"
+	}
+	b.WriteString("\n" + m.help(helpText))
+
 	return lipgloss.NewStyle().Padding(0, framePadding).Render(b.String())
 }
 
@@ -518,17 +602,50 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		// --- Startup Picker ---
+		// --- Startup Picker ---
 		if m.startup {
+			// Navigation/Fokuswechsel
 			switch mm.String() {
 			case "tab":
-				m.pickIdx = (m.pickIdx + 1) % len(m.pickOptions)
-				return m, nil
-			case "shift+tab":
-				m.pickIdx--
-				if m.pickIdx < 0 {
-					m.pickIdx = len(m.pickOptions) - 1
+				// Suche -> Liste
+				if m.filter.Focused() {
+					m.filter.Blur()
+					if m.pickIdx >= len(m.pickOptions) {
+						m.pickIdx = 0
+					}
+					return m, nil
+				}
+				// in der Liste weiter nach unten
+				if len(m.pickOptions) > 0 {
+					m.pickIdx = (m.pickIdx + 1) % len(m.pickOptions)
 				}
 				return m, nil
+
+			case "shift+tab":
+				// Liste -> zurück zur Suche
+				if !m.filter.Focused() {
+					_ = m.filter.Focus()
+					// Cursor ans Ende setzen (optional):
+					// m.filter.SetCursor(len(m.filter.Value()))
+					return m, nil
+				}
+				return m, nil
+
+			case "down", "ctrl+n":
+				if !m.filter.Focused() && len(m.pickOptions) > 0 {
+					m.pickIdx = (m.pickIdx + 1) % len(m.pickOptions)
+				}
+				return m, nil
+
+			case "up", "ctrl+p":
+				if !m.filter.Focused() && len(m.pickOptions) > 0 {
+					m.pickIdx--
+					if m.pickIdx < 0 {
+						m.pickIdx = len(m.pickOptions) - 1
+					}
+				}
+				return m, nil
+
 			case "enter":
 				choice := m.pickOptions[m.pickIdx]
 				if choice.Path == newAdrSentinel {
@@ -558,10 +675,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.editingPath = choice.Path
 				m.step = 0
 				return m, tea.Batch(m.focusForStep(), scheduleAutosave())
+
 			case "esc", "ctrl+c":
 				return m, tea.Quit
 			}
-			return m, nil
+
+			// Alle anderen Tasten gehen in das Suchfeld (und filtern live).
+			// Wenn die Suche nicht fokussiert ist und der User tippt/backspacet,
+			// Fokus zurück auf die Suche.
+			if !m.filter.Focused() && (mm.Type == tea.KeyRunes || mm.Type == tea.KeyBackspace) {
+				_ = m.filter.Focus()
+			}
+			var cmd tea.Cmd
+			old := m.filter.Value()
+			m.filter, cmd = m.filter.Update(mm)
+			if m.filter.Value() != old {
+				m.applyFilter(m.filter.Value())
+				m.pickIdx = 0
+			}
+			return m, cmd
+
 		}
 
 		// --- Schritte mit TAB/SHIFT+TAB ---
@@ -684,6 +817,296 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	return m, nil
+}
+
+/* ------------------------------- File Picker ---------------------------------- */
+
+// Relevanzgewichtung: Titel-Start > Titel-Contain > Rest im Inhalt
+func (m *model) applyFilter(q string) {
+	m.lastQuery = q
+	q = strings.ToLower(strings.TrimSpace(q))
+	base := m.allOptions
+	if len(base) == 0 {
+		m.pickOptions = nil
+		return
+	}
+
+	out := make([]fileOption, 0, len(base))
+	out = append(out, base[0]) // "+ Neuer ADR" immer oben
+	m.hitBadges = make(map[string][]string)
+	m.hitSnippet = make(map[string]string)
+
+	if q == "" {
+		out = append(out, base[1:]...)
+		m.pickOptions = out
+		if m.pickIdx >= len(m.pickOptions) {
+			m.pickIdx = 0
+		}
+		return
+	}
+
+	toks := strings.Fields(q)
+
+	type scored struct {
+		opt   fileOption
+		score int
+	}
+	hits := []scored{}
+
+	for _, opt := range base[1:] { // sentinel überspringen
+		doc := m.searchDocs[opt.Path]
+		label := strings.ToLower(opt.Label)
+
+		// AND-Logik: jedes Token muss irgendwo vorkommen
+		// (Label, Titel, Tags, Beteiligte, Kontext, Entscheidung, Alternativen, Konsequenzen)
+		combined := label + " " + doc.Full
+		ok := true
+		for _, t := range toks {
+			if !strings.Contains(combined, t) {
+				ok = false
+				break
+			}
+		}
+		if !ok {
+			continue
+		}
+
+		// Feld-Badges sammeln
+		badges := make([]string, 0, 4)
+		addIf := func(fieldText, badge string) {
+			if fieldText == "" {
+				return
+			}
+			for _, t := range toks {
+				if strings.Contains(strings.ToLower(fieldText), t) {
+					// uniq
+					present := false
+					for _, b := range badges {
+						if b == badge {
+							present = true
+							break
+						}
+					}
+					if !present {
+						badges = append(badges, badge)
+					}
+				}
+			}
+		}
+		addIf(opt.Label, "Dateiname")
+		addIf(doc.Title, "Titel")
+		addIf(doc.Tags, "Tags")
+		addIf(doc.Beteiligte, "Beteiligte")
+		addIf(doc.Kontext, "Kontext")
+		addIf(doc.Entscheidung, "Entscheidung")
+		addIf(doc.Alternativen, "Alternativen")
+		addIf(doc.Konsequenzen, "Konsequenzen")
+
+		// Score
+		s := 0
+		if strings.HasPrefix(label, q) {
+			s += 120
+		}
+		if strings.Contains(label, q) {
+			s += 80
+		}
+		for _, t := range toks {
+			if strings.Contains(strings.ToLower(doc.Title), t) {
+				s += 70
+			}
+			if strings.Contains(strings.ToLower(doc.Tags), t) {
+				s += 50
+			}
+			if strings.Contains(strings.ToLower(doc.Beteiligte), t) {
+				s += 30
+			}
+			if strings.Contains(strings.ToLower(doc.Kontext), t) ||
+				strings.Contains(strings.ToLower(doc.Entscheidung), t) ||
+				strings.Contains(strings.ToLower(doc.Alternativen), t) ||
+				strings.Contains(strings.ToLower(doc.Konsequenzen), t) {
+				s += 10
+			}
+		}
+
+		// Snippet (beste passende Quelle auswählen)
+		var srcLabel, srcText string
+		pick := func(lbl, txt string) bool {
+			if txt == "" {
+				return false
+			}
+			for _, t := range toks {
+				if strings.Contains(strings.ToLower(txt), t) {
+					srcLabel, srcText = lbl, txt
+					return true
+				}
+			}
+			return false
+		}
+		// Priorität
+		_ = pick("Titel", doc.Title) ||
+			pick("Tags", doc.Tags) ||
+			pick("Beteiligte", doc.Beteiligte) ||
+			pick("Kontext", doc.Kontext) ||
+			pick("Entscheidung", doc.Entscheidung) ||
+			pick("Alternativen", doc.Alternativen) ||
+			pick("Konsequenzen", doc.Konsequenzen) ||
+			pick("Dateiname", opt.Label)
+
+		// Snippet aufbereiten + highlighten
+		snippet := ""
+		if srcText != "" {
+			snippet = snippetStyle.Render(srcLabel+": ") + highlightAll(srcText, toks)
+		}
+
+		// speichern
+		m.hitBadges[opt.Path] = badges
+		m.hitSnippet[opt.Path] = snippet
+		hits = append(hits, scored{opt: opt, score: s})
+	}
+
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].score == hits[j].score {
+			if hits[i].opt.No == hits[j].opt.No {
+				return hits[i].opt.Label < hits[j].opt.Label
+			}
+			if hits[i].opt.No == 0 {
+				return false
+			}
+			if hits[j].opt.No == 0 {
+				return true
+			}
+			return hits[i].opt.No < hits[j].opt.No
+		}
+		return hits[i].score > hits[j].score
+	})
+
+	for _, h := range hits {
+		out = append(out, h.opt)
+	}
+	m.pickOptions = out
+	if m.pickIdx >= len(m.pickOptions) {
+		m.pickIdx = 0
+	}
+}
+
+func highlightAll(text string, toks []string) string {
+	out := text
+	for _, t := range toks {
+		if t == "" {
+			continue
+		}
+		// case-insensitive ersetzen
+		re := regexp.MustCompile("(?i)" + regexp.QuoteMeta(t))
+		out = re.ReplaceAllStringFunc(out, func(m string) string {
+			return highlightStyle.Render(m)
+		})
+	}
+	return out
+}
+
+// Liest Inhalte für die Volltextsuche (MD + Drafts)
+func buildSearchDocs(opts []fileOption) map[string]searchDoc {
+	idx := make(map[string]searchDoc, len(opts))
+	for _, o := range opts {
+		if o.Path == newAdrSentinel {
+			continue
+		}
+		var d searchDoc
+		if strings.HasSuffix(o.Path, ".md") {
+			d = parseADRForSearch(o.Path)
+		} else if strings.HasSuffix(o.Path, ".draft.json") {
+			d = parseDraftForSearch(o.Path)
+		}
+		// Fulltext (alles kleingeschrieben)
+		var sb strings.Builder
+		sb.WriteString(strings.ToLower(o.Label) + " ")
+		sb.WriteString(strings.ToLower(d.Title) + " ")
+		sb.WriteString(strings.ToLower(d.Status) + " ")
+		sb.WriteString(strings.ToLower(d.Beteiligte) + " ")
+		sb.WriteString(strings.ToLower(d.Tags) + " ")
+		sb.WriteString(strings.ToLower(d.Kontext) + " ")
+		sb.WriteString(strings.ToLower(d.Entscheidung) + " ")
+		sb.WriteString(strings.ToLower(d.Alternativen) + " ")
+		sb.WriteString(strings.ToLower(d.Konsequenzen))
+		d.Full = sb.String()
+		idx[o.Path] = d
+	}
+	return idx
+}
+
+func parseADRForSearch(path string) searchDoc {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return searchDoc{}
+	}
+	txt := string(b)
+
+	// Titel + Nummer
+	h1 := regexp.MustCompile(`(?m)^#\s*(?:ADR\s+\d+:\s*)?(.*)$`).FindStringSubmatch(txt)
+	title := ""
+	if len(h1) >= 2 {
+		t := strings.TrimSpace(h1[1])
+		if !strings.HasPrefix(t, "|") {
+			title = t
+		}
+	}
+
+	// Tabellen-Felder
+	rowRe := regexp.MustCompile(`(?m)^\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|`)
+	var status, beteiligte, tags string
+	for _, mm := range rowRe.FindAllStringSubmatch(txt, -1) {
+		key := strings.TrimSpace(strings.ToLower(mm[1]))
+		val := strings.TrimSpace(mm[2])
+		switch key {
+		case "status":
+			status = val
+		case "beteiligte":
+			beteiligte = val
+		case "tags":
+			tags = val
+		}
+	}
+
+	// Abschnitte
+	kontext := extractSection(txt, "Kontext")
+	entscheidung := extractSection(txt, "Entscheidung")
+	alternativen := extractSection(txt, "Alternativen")
+	konsequenzen := extractSection(txt, "Konsequenzen")
+
+	return searchDoc{
+		Title: title, Status: status, Beteiligte: beteiligte, Tags: tags,
+		Kontext: kontext, Entscheidung: entscheidung, Alternativen: alternativen, Konsequenzen: konsequenzen,
+	}
+}
+
+func parseDraftForSearch(path string) searchDoc {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return searchDoc{}
+	}
+	var d struct {
+		Title, Kontext                           string
+		Entscheidung, Konsequenzen, Alternativen []string
+		Beteiligte, Tags                         string
+		StatusIdx                                int
+	}
+	if json.Unmarshal(b, &d) != nil {
+		return searchDoc{}
+	}
+	status := ""
+	if d.StatusIdx >= 0 && d.StatusIdx < len(statuses) {
+		status = statuses[d.StatusIdx]
+	}
+	return searchDoc{
+		Title:        d.Title,
+		Status:       status,
+		Beteiligte:   d.Beteiligte,
+		Tags:         d.Tags,
+		Kontext:      d.Kontext,
+		Entscheidung: strings.Join(d.Entscheidung, " "),
+		Alternativen: strings.Join(d.Alternativen, " "),
+		Konsequenzen: strings.Join(d.Konsequenzen, " "),
+	}
 }
 
 /* --------------------------------- Save ----------------------------------- */
@@ -822,7 +1245,6 @@ func quickTitleForFile(path string) string {
 
 	return t
 }
-
 
 type parsedADR struct {
 	No           int
@@ -1214,7 +1636,6 @@ func writeADR(m model) (string, error) {
 	}
 	return path, nil
 }
-
 
 func buildMarkdownPreview(m model) string {
 	no := m.editingNo
