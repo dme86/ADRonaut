@@ -1172,7 +1172,10 @@ func writeADR(m model) (string, error) {
 	}
 
 	no := m.editingNo
-	path := m.editingPath
+	oldPath := m.editingPath
+	path := oldPath
+	title := strings.TrimSpace(m.Title())
+
 	if path == "" {
 		// Neuer ADR
 		var err error
@@ -1180,35 +1183,38 @@ func writeADR(m model) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		title := strings.TrimSpace(m.Title())
-		var slug string
-		if title == "" {
-			slug = noTitleSlug()
-		} else {
+		slug := noTitleSlug()
+		if title != "" {
 			slug = slugify(title)
 		}
-		filename := fmt.Sprintf("ADR-%04d-%s.md", no, slug)
-		path = filepath.Join(dir, filename)
+		path = filepath.Join(dir, fmt.Sprintf("ADR-%04d-%s.md", no, slug))
+	} else {
+		// Bestehende Datei: falls jetzt ein Titel vorhanden ist, Zielname anpassen
+		if title != "" {
+			desired := filepath.Join(dir, fmt.Sprintf("ADR-%04d-%s.md", no, slugify(title)))
+			if desired != path {
+				path = desired
+			}
+		}
 	}
 
 	date := time.Now().Format("2006-01-02")
 	content := buildMarkdown(
-		no,
-		m.Title(),
-		date,
-		m.Status(),
-		m.Beteiligte(),
-		m.Tags(),
-		m.Kontext(),
-		m.Entscheidung(),
-		m.Alternativen(),
-		m.Konsequenzen(),
+		no, m.Title(), date, m.Status(), m.Beteiligte(), m.Tags(),
+		m.Kontext(), m.Entscheidung(), m.Alternativen(), m.Konsequenzen(),
 	)
+
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return "", err
 	}
+
+	// Alte Datei entfernen, wenn der Name geändert wurde
+	if oldPath != "" && oldPath != path {
+		_ = os.Remove(oldPath)
+	}
 	return path, nil
 }
+
 
 func buildMarkdownPreview(m model) string {
 	no := m.editingNo
