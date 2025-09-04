@@ -20,6 +20,19 @@ import (
 
 /* ------------------------------- Styles ---------------------------------- */
 
+// Gruvbox xterm-256 approximations
+const (
+	gbRed    = "203" // #fb4934
+	gbGreen  = "142" // #b8bb26
+	gbYellow = "214" // #fabd2f
+	gbBlue   = "109" // #83a598
+	gbPurple = "175" // #d3869b
+	gbAqua   = "108" // #8ec07c
+	gbOrange = "208" // #fe8019
+	gbGray   = "245" // #928374
+	gbBg0    = "235" // #282828
+)
+
 var (
 	statuses = []string{"Vorgeschlagen", "Angenommen", "Abgelehnt", "Veraltet"}
 
@@ -41,14 +54,14 @@ var (
 			Foreground(lipgloss.Color("0"))
 
 	chipColors = map[string]string{
-		"Titel":        "219", // pink
-		"Tags":         "135", // magenta
-		"Beteiligte":   "39",  // blau
-		"Kontext":      "70",  // grün
-		"Entscheidung": "214", // orange
-		"Alternativen": "63",  // violett
-		"Konsequenzen": "203", // rot
-		"Dateiname":    "244", // grau
+		"Titel":        gbYellow,
+		"Tags":         gbPurple,
+		"Beteiligte":   gbBlue,
+		"Kontext":      gbGreen,
+		"Entscheidung": gbOrange,
+		"Alternativen": gbAqua,
+		"Konsequenzen": gbRed,
+		"Dateiname":    gbGray,
 	}
 
 	snippetStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
@@ -61,6 +74,13 @@ const (
 	autosaveDir      = ".adronaut"
 	autosaveInterval = 3 * time.Second
 )
+
+/* ------------------------------ Counter --------------------------------- */
+
+type badge struct {
+	Label string
+	Count int
+}
 
 /* ------------------------------ Messages --------------------------------- */
 
@@ -185,13 +205,14 @@ func (lf *listField) NonEmptyCount() int {
 
 // Draft-Helfer
 
-func chip(label string) string {
-	bg := chipColors[label]
+func chipWithCount(b badge) string {
+	bg := chipColors[b.Label]
 	st := chipBase
 	if bg != "" {
 		st = st.Background(lipgloss.Color(bg))
 	}
-	return st.Render(label)
+	// {Label} [Count]
+	return st.Render(fmt.Sprintf("{%s} [%d]", b.Label, b.Count))
 }
 
 func (lf *listField) Values() []string {
@@ -272,7 +293,7 @@ type model struct {
 	searchIndex map[string]string
 
 	searchDocs map[string]searchDoc
-	hitBadges  map[string][]string
+	hitBadges  map[string][]badge
 	hitSnippet map[string]string
 	lastQuery  string
 
@@ -371,11 +392,30 @@ func initialModel() model {
 
 	m.statusIdx = 0 // Vorgeschlagen
 
+	// Wenn es weder ADR-Dateien noch Drafts gibt -> direkt in den Editor springen
+	if len(opts) == 0 && len(drafts) == 0 {
+		m.startup = false
+		m.editingPath = ""
+		m.editingNo = 0
+		m.draftFixedPath = filepath.Join(autosaveDir, fmt.Sprintf("new-%d.draft.json", time.Now().UnixNano()))
+		m.step = 0
+		_ = m.title.Focus() // Cursor direkt in den Titel
+	} else {
+		// Nur wenn wir den Picker zeigen, die Suche befüllen
+		m.applyFilter("") // initial alle anzeigen
+		m.startup = true
+		m.pickIdx = 0
+	}
+
 	return m
 }
 
 func (m model) Init() tea.Cmd {
-	return textinput.Blink
+	if m.startup {
+		return textinput.Blink
+	}
+	// Direkt im Editor: Fokus + Autosave starten
+	return tea.Batch(textinput.Blink, m.focusForStep(), scheduleAutosave())
 }
 
 /* ---------------------------------- View ---------------------------------- */
@@ -424,7 +464,6 @@ func (m model) viewPicker() string {
 	}
 
 	// Liste rendern
-	// Liste rendern
 	for i, opt := range m.pickOptions {
 		st := optionStyle
 		isSel := (!m.filter.Focused() && i == m.pickIdx)
@@ -436,8 +475,8 @@ func (m model) viewPicker() string {
 
 		// Badges anhängen
 		if bs := m.hitBadges[opt.Path]; len(bs) > 0 {
-			for _, b := range bs {
-				line += " " + chip(b)
+			for _, bb := range bs {
+				line += " " + chipWithCount(bb)
 			}
 		}
 		b.WriteString(line + "\n")
@@ -451,7 +490,7 @@ func (m model) viewPicker() string {
 	}
 
 	// Kontextsensitive Hilfe
-	helpText := "TAB oder ↑/↓ wählen · SHIFT/Tab zurück zur Suche · ENTER öffnen · ESC/STRG+C beenden"
+	helpText := "TAB oder ↑/↓ wählen · SHIFT+Tab zurück zur Suche · ENTER öffnen · ESC/STRG+C beenden"
 	if m.filter.Focused() {
 		helpText = "TAB zur Liste · ENTER öffnen · ESC/STRG+C beenden"
 	}
@@ -494,17 +533,19 @@ func (m model) View() string {
 		b.WriteString(labelStyle.Render("Entscheidung"))
 		b.WriteString(fmt.Sprintf("  (%d/%d)\n", m.entscheidung.idx+1, len(m.entscheidung.items)))
 		b.WriteString(m.entscheidung.current().View())
-		b.WriteString("\n\n" + m.help("CTRL+G nächster Punkt · CTRL+O/CTRL+ENTER neuer Punkt · CTRL+X löschen · TAB weiter · SHIFT+TAB zurück"))
+		b.WriteString("\n\n" + m.help("CTRL+O neuer Punkt · CTRL+G nächster Punkt · CTRL+X Punkt löschen · TAB weiter · SHIFT+TAB zurück"))
 	case 4:
 		b.WriteString(labelStyle.Render("Konsequenzen"))
 		b.WriteString(fmt.Sprintf("  (%d/%d)\n", m.konsequenzen.idx+1, len(m.konsequenzen.items)))
 		b.WriteString(m.konsequenzen.current().View())
-		b.WriteString("\n\n" + m.help("CTRL+G nächster Punkt · CTRL+O/CTRL+ENTER neuer Punkt · CTRL+X löschen · TAB weiter · SHIFT+TAB zurück"))
+		b.WriteString("\n\n" + m.help("CTRL+O neuer Punkt · CTRL+G nächster Punkt · CTRL+X Punkt löschen · TAB weiter · SHIFT+TAB zurück"))
+
 	case 5:
 		b.WriteString(labelStyle.Render("Alternativen"))
 		b.WriteString(fmt.Sprintf("  (%d/%d)\n", m.alternativen.idx+1, len(m.alternativen.items)))
 		b.WriteString(m.alternativen.current().View())
-		b.WriteString("\n\n" + m.help("CTRL+G nächster Punkt · CTRL+O/CTRL+ENTER neuer Punkt · CTRL+X löschen · TAB weiter · SHIFT+TAB zurück"))
+		b.WriteString("\n\n" + m.help("CTRL+O neuer Punkt · CTRL+G nächster Punkt · CTRL+X Punkt löschen · TAB weiter · SHIFT+TAB zurück"))
+
 	case 6:
 		b.WriteString(labelStyle.Render("Beteiligte (Komma-getrennt)") + "\n")
 		b.WriteString(m.beteiligte.View())
@@ -540,6 +581,25 @@ func (m model) View() string {
 	}
 
 	return lipgloss.NewStyle().Padding(0, framePadding).Render(b.String())
+}
+
+/* ------------------------------- Counter ------------------------------------ */
+
+// zählt alle (nicht überlappenden) Treffer aller Tokens – case-insensitive
+func countAllMatchesCI(text string, toks []string) int {
+	if text == "" {
+		return 0
+	}
+	total := 0
+	lower := strings.ToLower(text)
+	for _, t := range toks {
+		if t == "" {
+			continue
+		}
+		re := regexp.MustCompile("(?i)" + regexp.QuoteMeta(t))
+		total += len(re.FindAllStringIndex(lower, -1))
+	}
+	return total
 }
 
 /* ------------------------------- Focus ------------------------------------ */
@@ -833,7 +893,7 @@ func (m *model) applyFilter(q string) {
 
 	out := make([]fileOption, 0, len(base))
 	out = append(out, base[0]) // "+ Neuer ADR" immer oben
-	m.hitBadges = make(map[string][]string)
+	m.hitBadges = make(map[string][]badge)
 	m.hitSnippet = make(map[string]string)
 
 	if q == "" {
@@ -857,8 +917,7 @@ func (m *model) applyFilter(q string) {
 		doc := m.searchDocs[opt.Path]
 		label := strings.ToLower(opt.Label)
 
-		// AND-Logik: jedes Token muss irgendwo vorkommen
-		// (Label, Titel, Tags, Beteiligte, Kontext, Entscheidung, Alternativen, Konsequenzen)
+		// AND: jedes Token muss vorkommen
 		combined := label + " " + doc.Full
 		ok := true
 		for _, t := range toks {
@@ -871,38 +930,32 @@ func (m *model) applyFilter(q string) {
 			continue
 		}
 
-		// Feld-Badges sammeln
-		badges := make([]string, 0, 4)
-		addIf := func(fieldText, badge string) {
-			if fieldText == "" {
-				return
-			}
-			for _, t := range toks {
-				if strings.Contains(strings.ToLower(fieldText), t) {
-					// uniq
-					present := false
-					for _, b := range badges {
-						if b == badge {
-							present = true
-							break
-						}
-					}
-					if !present {
-						badges = append(badges, badge)
-					}
-				}
+		// ---- BADGES MIT COUNTS ----
+		cFile := countAllMatchesCI(opt.Label, toks)
+		cTitle := countAllMatchesCI(doc.Title, toks)
+		cTags := countAllMatchesCI(doc.Tags, toks)
+		cBeteiligte := countAllMatchesCI(doc.Beteiligte, toks)
+		cKontext := countAllMatchesCI(doc.Kontext, toks)
+		cEntsch := countAllMatchesCI(doc.Entscheidung, toks)
+		cAlt := countAllMatchesCI(doc.Alternativen, toks)
+		cKonseq := countAllMatchesCI(doc.Konsequenzen, toks)
+
+		badges := make([]badge, 0, 8)
+		add := func(lbl string, c int) {
+			if c > 0 {
+				badges = append(badges, badge{Label: lbl, Count: c})
 			}
 		}
-		addIf(opt.Label, "Dateiname")
-		addIf(doc.Title, "Titel")
-		addIf(doc.Tags, "Tags")
-		addIf(doc.Beteiligte, "Beteiligte")
-		addIf(doc.Kontext, "Kontext")
-		addIf(doc.Entscheidung, "Entscheidung")
-		addIf(doc.Alternativen, "Alternativen")
-		addIf(doc.Konsequenzen, "Konsequenzen")
+		add("Dateiname", cFile)
+		add("Titel", cTitle)
+		add("Tags", cTags)
+		add("Beteiligte", cBeteiligte)
+		add("Kontext", cKontext)
+		add("Entscheidung", cEntsch)
+		add("Alternativen", cAlt)
+		add("Konsequenzen", cKonseq)
 
-		// Score
+		// ---- SCORING (deine Basis + Bonus nach Count) ----
 		s := 0
 		if strings.HasPrefix(label, q) {
 			s += 120
@@ -927,35 +980,31 @@ func (m *model) applyFilter(q string) {
 				s += 10
 			}
 		}
+		// Bonus: reine Trefferanzahl je Feld
+		s += 2*cTitle + cTags + cBeteiligte + cKontext + cEntsch + cAlt + cKonseq + cFile
 
-		// Snippet (beste passende Quelle auswählen)
-		var srcLabel, srcText string
-		pick := func(lbl, txt string) bool {
-			if txt == "" {
-				return false
-			}
-			for _, t := range toks {
-				if strings.Contains(strings.ToLower(txt), t) {
-					srcLabel, srcText = lbl, txt
-					return true
+		// ---- SNIPPET (Feld mit größter Trefferzahl) ----
+		var snippet string
+		{
+			max := 0
+			srcLabel, srcText := "", ""
+			check := func(c int, l, t string) {
+				if c > max {
+					max, srcLabel, srcText = c, l, t
 				}
 			}
-			return false
-		}
-		// Priorität
-		_ = pick("Titel", doc.Title) ||
-			pick("Tags", doc.Tags) ||
-			pick("Beteiligte", doc.Beteiligte) ||
-			pick("Kontext", doc.Kontext) ||
-			pick("Entscheidung", doc.Entscheidung) ||
-			pick("Alternativen", doc.Alternativen) ||
-			pick("Konsequenzen", doc.Konsequenzen) ||
-			pick("Dateiname", opt.Label)
+			check(cTitle, "Titel", doc.Title)
+			check(cTags, "Tags", doc.Tags)
+			check(cBeteiligte, "Beteiligte", doc.Beteiligte)
+			check(cKontext, "Kontext", doc.Kontext)
+			check(cEntsch, "Entscheidung", doc.Entscheidung)
+			check(cAlt, "Alternativen", doc.Alternativen)
+			check(cKonseq, "Konsequenzen", doc.Konsequenzen)
+			check(cFile, "Dateiname", opt.Label)
 
-		// Snippet aufbereiten + highlighten
-		snippet := ""
-		if srcText != "" {
-			snippet = snippetStyle.Render(srcLabel+": ") + highlightAll(srcText, toks)
+			if srcText != "" {
+				snippet = snippetStyle.Render(srcLabel+": ") + highlightAll(srcText, toks)
+			}
 		}
 
 		// speichern
