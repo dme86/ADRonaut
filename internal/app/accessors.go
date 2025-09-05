@@ -1,5 +1,4 @@
-// accessors.go
-package main
+package app
 
 import "strings"
 

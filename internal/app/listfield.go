@@ -1,4 +1,4 @@
-package main
+package app
 
 /* --------- Listen-Feld (für Entscheidung/Konsequenzen/Alternativen) ------ */
 
