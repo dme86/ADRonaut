@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -93,6 +94,12 @@ type autosaveTickMsg struct{}
 type autosaveDoneMsg struct {
 	path string
 	err  error
+}
+
+type gitInfoLoadedMsg struct {
+	name       string
+	email      string
+	signingKey string
 }
 
 /* --------- Listen-Feld (für Entscheidung/Konsequenzen/Alternativen) ------ */
@@ -292,6 +299,14 @@ type model struct {
 	filter      textinput.Model
 	searchIndex map[string]string
 
+	createdDate  string
+	lastEditedBy string
+	lastEditedAt string
+
+	gitName       string
+	gitEmail      string
+	gitSigningKey string
+
 	searchDocs map[string]searchDoc
 	hitBadges  map[string][]badge
 	hitSnippet map[string]string
@@ -412,10 +427,9 @@ func initialModel() model {
 
 func (m model) Init() tea.Cmd {
 	if m.startup {
-		return textinput.Blink
+		return tea.Batch(textinput.Blink, loadGitInfoCmd())
 	}
-	// Direkt im Editor: Fokus + Autosave starten
-	return tea.Batch(textinput.Blink, m.focusForStep(), scheduleAutosave())
+	return tea.Batch(textinput.Blink, m.focusForStep(), scheduleAutosave(), loadGitInfoCmd())
 }
 
 /* ---------------------------------- View ---------------------------------- */
@@ -642,6 +656,12 @@ func (m *model) focusForStep() tea.Cmd {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch mm := msg.(type) {
+
+	case gitInfoLoadedMsg:
+		m.gitName = mm.name
+		m.gitEmail = mm.email
+		m.gitSigningKey = mm.signingKey
+		return m, nil
 
 	case saveDoneMsg:
 		return m.handleSaveDone(mm)
@@ -1299,6 +1319,9 @@ type parsedADR struct {
 	No           int
 	Title        string
 	Date         string
+	CreatedDate  string
+	LastEditedBy string
+	LastEditedAt string
 	Status       string
 	Beteiligte   string
 	Tags         string
@@ -1339,9 +1362,19 @@ func (m *model) loadFromFile(path string) error {
 	for _, mm := range rowRe.FindAllStringSubmatch(txt, -1) {
 		key := strings.TrimSpace(strings.ToLower(mm[1]))
 		val := strings.TrimSpace(mm[2])
+
 		switch key {
-		case "datum":
+		case "datum (erstellt)":
+			pa.CreatedDate = val
+		case "datum": // Abwärtskompatibilität
 			pa.Date = val
+			if pa.CreatedDate == "" {
+				pa.CreatedDate = val
+			}
+		case "zuletzt editiert von":
+			pa.LastEditedBy = val
+		case "zuletzt editiert am":
+			pa.LastEditedAt = val
 		case "status":
 			pa.Status = val
 		case "beteiligte":
@@ -1419,6 +1452,13 @@ func (m *model) fillFromParsed(p parsedADR) {
 		m.tags.SetValue(p.Tags)
 	}
 
+	if strings.TrimSpace(p.CreatedDate) != "" {
+		m.createdDate = p.CreatedDate
+	} else if strings.TrimSpace(p.Date) != "" {
+		m.createdDate = p.Date
+	}
+	m.lastEditedBy = strings.TrimSpace(p.LastEditedBy)
+	m.lastEditedAt = strings.TrimSpace(p.LastEditedAt)
 	m.editingNo = p.No
 }
 
@@ -1436,6 +1476,7 @@ type draftFile struct {
 	Beteiligte   string    `json:"beteiligte"`
 	Tags         string    `json:"tags"`
 	SavedAt      time.Time `json:"saved_at"`
+	CreatedDate  string    `json:"created_date"`
 }
 
 func (m model) draftPath() string {
@@ -1468,6 +1509,7 @@ func (m model) toDraft() draftFile {
 		Beteiligte:   m.beteiligte.Value(),
 		Tags:         m.tags.Value(),
 		SavedAt:      time.Now(),
+		CreatedDate:  m.createdDate,
 	}
 }
 
@@ -1495,6 +1537,7 @@ func (m *model) loadDraft(path string) error {
 	m.alternativen.SetFromSlice(d.Alternativen, 5, w)
 	m.beteiligte.SetValue(d.Beteiligte)
 	m.tags.SetValue(d.Tags)
+	m.createdDate = d.CreatedDate
 	return nil
 }
 
@@ -1558,6 +1601,24 @@ func autosaveCmd(m model) tea.Cmd {
 			err = atomicWrite(path, b, 0o644)
 		}
 		return autosaveDoneMsg{path: path, err: err}
+	}
+}
+
+func loadGitInfoCmd() tea.Cmd {
+	return func() tea.Msg {
+		// liest "git config --get <key>"; leer bei Fehler/nicht gesetzt
+		get := func(key string) string {
+			out, err := exec.Command("git", "config", "--get", key).CombinedOutput()
+			if err != nil {
+				return ""
+			}
+			return strings.TrimSpace(string(out))
+		}
+		return gitInfoLoadedMsg{
+			name:       get("user.name"),
+			email:      get("user.email"),
+			signingKey: get("user.signingkey"),
+		}
 	}
 }
 
@@ -1648,7 +1709,6 @@ func writeADR(m model) (string, error) {
 	title := strings.TrimSpace(m.Title())
 
 	if path == "" {
-		// Neuer ADR
 		var err error
 		no, err = nextADRNumber(dir)
 		if err != nil {
@@ -1659,27 +1719,48 @@ func writeADR(m model) (string, error) {
 			slug = slugify(title)
 		}
 		path = filepath.Join(dir, fmt.Sprintf("ADR-%04d-%s.md", no, slug))
-	} else {
-		// Bestehende Datei: falls jetzt ein Titel vorhanden ist, Zielname anpassen
-		if title != "" {
-			desired := filepath.Join(dir, fmt.Sprintf("ADR-%04d-%s.md", no, slugify(title)))
-			if desired != path {
-				path = desired
-			}
+	} else if title != "" {
+		desired := filepath.Join(dir, fmt.Sprintf("ADR-%04d-%s.md", no, slugify(title)))
+		if desired != path {
+			path = desired
 		}
 	}
 
-	date := time.Now().Format("2006-01-02")
+	now := time.Now().Format("2006-01-02")
+
+	created := strings.TrimSpace(m.createdDate)
+	if created == "" {
+		created = now
+		m.createdDate = created
+	}
+
+	by := strings.TrimSpace(m.gitName)
+	if by == "" {
+		if strings.TrimSpace(m.gitEmail) != "" {
+			by = m.gitEmail
+		} else {
+			by = "Unbekannt"
+		}
+	}
+	editedAt := now
+	m.lastEditedBy = by
+	m.lastEditedAt = editedAt
+
 	content := buildMarkdown(
-		no, m.Title(), date, m.Status(), m.Beteiligte(), m.Tags(),
+		no,
+		m.Title(),
+		created,
+		m.Status(),
+		m.Beteiligte(),
+		m.Tags(),
+		m.gitName, m.gitEmail, m.gitSigningKey,
+		by, editedAt,
 		m.Kontext(), m.Entscheidung(), m.Alternativen(), m.Konsequenzen(),
 	)
 
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return "", err
 	}
-
-	// Alte Datei entfernen, wenn der Name geändert wurde
 	if oldPath != "" && oldPath != path {
 		_ = os.Remove(oldPath)
 	}
@@ -1688,8 +1769,38 @@ func writeADR(m model) (string, error) {
 
 func buildMarkdownPreview(m model) string {
 	no := m.editingNo
-	date := time.Now().Format("2006-01-02")
-	md := buildMarkdown(no, m.Title(), date, m.Status(), m.Beteiligte(), m.Tags(), m.Kontext(), m.Entscheidung(), m.Alternativen(), m.Konsequenzen())
+	today := time.Now().Format("2006-01-02")
+
+	created := strings.TrimSpace(m.createdDate)
+	if created == "" {
+		created = today
+	}
+
+	by := strings.TrimSpace(m.gitName)
+	if by == "" {
+		if strings.TrimSpace(m.gitEmail) != "" {
+			by = m.gitEmail
+		} else {
+			by = "Unbekannt"
+		}
+	}
+
+	editedAt := strings.TrimSpace(m.lastEditedAt)
+	if editedAt == "" {
+		editedAt = today
+	}
+
+	md := buildMarkdown(
+		no,
+		m.Title(),
+		created,
+		m.Status(),
+		m.Beteiligte(),
+		m.Tags(),
+		m.gitName, m.gitEmail, m.gitSigningKey,
+		by, editedAt,
+		m.Kontext(), m.Entscheidung(), m.Alternativen(), m.Konsequenzen(),
+	)
 	lines := strings.Split(md, "\n")
 	if len(lines) > 20 {
 		lines = lines[:20]
@@ -1697,7 +1808,13 @@ func buildMarkdownPreview(m model) string {
 	return strings.Join(lines, "\n")
 }
 
-func buildMarkdown(no int, title, date, status, beteiligte, tags, kontext, entscheidung, alternativen, konsequenzen string) string {
+func buildMarkdown(
+	no int,
+	title, createdDate, status, beteiligte, tags string,
+	authorName, authorEmail, signingKey string,
+	lastEditedBy, lastEditedAt string,
+	kontext, entscheidung, alternativen, konsequenzen string,
+) string {
 	noTitle := title
 	if no > 0 {
 		noTitle = fmt.Sprintf("ADR %04d: %s", no, title)
@@ -1705,34 +1822,77 @@ func buildMarkdown(no int, title, date, status, beteiligte, tags, kontext, entsc
 	b := &strings.Builder{}
 	fmt.Fprintf(b, "# %s\n\n", noTitle)
 	fmt.Fprintf(b, "| Feld | Wert |\n|------|------|\n")
-	fmt.Fprintf(b, "| Datum | %s |\n", date)
+
+	// Erstell-Datum
+	if strings.TrimSpace(createdDate) != "" {
+		fmt.Fprintf(b, "| Datum (erstellt) | %s |\n", createdDate)
+	} else {
+		// Fallback, sollte praktisch nicht mehr vorkommen
+		fmt.Fprintf(b, "| Datum (erstellt) | %s |\n", time.Now().Format("2006-01-02"))
+	}
+
+	// Status
 	fmt.Fprintf(b, "| Status | %s |\n", status)
+
+	// Autor (aus git config)
+	author := ""
+	switch {
+	case authorName != "" && authorEmail != "":
+		author = fmt.Sprintf("%s <%s>", authorName, authorEmail)
+	case authorName != "":
+		author = authorName
+	case authorEmail != "":
+		author = authorEmail
+	}
+	if strings.TrimSpace(author) != "" {
+		fmt.Fprintf(b, "| Autor | %s |\n", author)
+	}
+
+	// Signing-Key
+	if strings.TrimSpace(signingKey) != "" {
+		fmt.Fprintf(b, "| Signing-Key | %s |\n", signingKey)
+	}
+
+	// Zuletzt editiert (neu)
+	if strings.TrimSpace(lastEditedBy) != "" {
+		fmt.Fprintf(b, "| Zuletzt editiert von | %s |\n", lastEditedBy)
+	}
+	if strings.TrimSpace(lastEditedAt) != "" {
+		fmt.Fprintf(b, "| Zuletzt editiert am | %s |\n", lastEditedAt)
+	}
+
+	// Beteiligte/Tags
 	if strings.TrimSpace(beteiligte) != "" {
 		fmt.Fprintf(b, "| Beteiligte | %s |\n", beteiligte)
 	}
 	if strings.TrimSpace(tags) != "" {
 		fmt.Fprintf(b, "| Tags | %s |\n", tags)
 	}
+
 	b.WriteString("\n## Kontext\n")
 	if strings.TrimSpace(kontext) == "" {
 		kontext = "(noch offen)"
 	}
 	b.WriteString(kontext + "\n\n")
+
 	b.WriteString("## Entscheidung\n")
 	if strings.TrimSpace(entscheidung) == "" {
 		entscheidung = "(noch offen)"
 	}
 	b.WriteString(entscheidung + "\n\n")
+
 	b.WriteString("## Alternativen\n")
 	if strings.TrimSpace(alternativen) == "" {
 		alternativen = "(keine oder noch offen)"
 	}
 	b.WriteString(alternativen + "\n\n")
+
 	b.WriteString("## Konsequenzen\n")
 	if strings.TrimSpace(konsequenzen) == "" {
 		konsequenzen = "(noch offen)"
 	}
 	b.WriteString(konsequenzen + "\n\n")
+
 	b.WriteString("## Verweise\n- \n")
 	return b.String()
 }
